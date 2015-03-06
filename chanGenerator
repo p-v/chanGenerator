@@ -1,0 +1,563 @@
+#!/usr/bin/env python
+
+""" chanGenerator
+Generate changes for your github repository """
+
+import json
+import requests as r
+from requests import ConnectionError
+from pprint import pprint
+import subprocess
+import sys
+import time
+import os
+import argparse
+from datetime import datetime, timedelta
+import calendar
+import getpass
+
+
+#required queries
+FETCH_ISSUES='https://api.github.com/repos/{0}/{1}/issues?since={2}&state=closed'
+FETCH_CLOSED_ISSUES='https://api.github.com/repos/{0}/{1}/issues?state=closed'
+FETCH_COMMIT='https://api.github.com/repos/{0}/{1}/commits/{2}'
+FETCH_ISSUES_BETWEEN='https://api.github.com/search/issues?q=closed:{2}..{3}+state:closed+repo:{0}/{1}&sort=closed&order=asc'
+FETCH_TAGS='https://api.github.com/repos/{0}/{1}/git/refs/tags/{2}'
+FETCH_TAG='https://api.github.com/repos/{0}/{1}/git/tags/{2}'
+FETCH_RATE_LIMIT='https://api.github.com/rate_limit'
+
+time_format="%Y-%m-%dT%H:%M:%SZ" #github issues api time format
+simple_date_format="%Y-%m-%d"  #time format for search api
+
+debug=False
+private=False
+categorize=False
+hide_links=False
+header="[Put version here]"
+labels_included=[]
+labels_excluded=[]
+
+uname=''  #user/organization name
+rname=''  #repository name
+
+query_dict = {'commit':2,'tag':4,'other':1}
+
+class Issue(object):
+    
+    def __init__(self):
+        self._title = None
+        self._url = None
+        self._number = None
+  
+    @property
+    def number(self):
+        return self._number
+
+    @number.setter
+    def number(self,value):
+        self._number = value
+    
+    @property
+    def title(self):
+        return self._title
+
+    @title.setter
+    def title(self,value):
+        self._title = value
+
+    @property
+    def url(self):
+        return self._url
+
+    @url.setter
+    def url(self,value):
+        self._url = value
+
+    def __attrs(self):
+        return (self._number, self._url, self._number)
+
+    def __eq__(self,other):
+        return isinstance(other,Issue) and self.__attrs() == other.__attrs()
+
+    def __hash__(self):
+        return hash(self.__attrs())
+
+#--------------- post fetch parsing -----------------------
+def commit_ts_extraction(commit_ts, json_resp):
+    """
+    Extract data out of json
+    ignores the closed tags before the commit's timestamp
+    """
+    #filter out older closed issues
+    to_ts = to_timestamp(commit_ts,time_format)
+    
+    issues_dict={}
+
+    for inobj in json_resp:
+        r_to_ts = to_timestamp(inobj["closed_at"],time_format)
+        if r_to_ts > to_ts:
+            #eligible.. lets get the details out of it
+            add_iss_label(inobj,issues_dict)
+
+    generate_markdown(issues_dict)
+
+
+def time_range_extraction(start_time,end_time,json_resp, is_time):
+    """
+    Extract data out of json
+    consider only issue between start time and end time
+    """
+    st_tmp = None
+    et_tmp = None
+    if is_time:
+        st_tmp = to_timestamp(start_time,time_format)
+        et_tmp = to_timestamp(end_time,time_format)
+    issues_dict={}
+    for inobj in json_resp:
+        if is_time:
+            #contains time so do something
+            r_to_ts = to_timestamp(inobj["closed_at"],time_format)
+            if r_to_ts <= et_tmp and r_to_ts >= st_tmp:
+                #eligible.. lets get the details out of it
+                add_iss_label(inobj,issues_dict)
+        else:
+            add_iss_label(inobj,issues_dict)
+            
+    generate_markdown(issues_dict)
+
+def extraction(json):
+    """
+    extract data out of json
+    no constraint
+    """
+    issues_dict={}
+
+    for inobj in json:
+        add_iss_label(inobj,issues_dict)
+
+    generate_markdown(issues_dict)
+
+
+def generate_markdown(issue_dict):
+    """
+    create markdown for the issues
+    """
+    if len(issue_dict) == 0:
+        print "Nothing to put down on changelog"
+        sys.exit(0)
+    #prepare markdown text
+    md_txt=''
+    md_txt='# **Changelog**\n'
+
+    md_txt += '## '
+    md_txt += header
+    md_txt += '\n'
+
+    if not categorize:
+        unq_iss_lst = set()
+        for label,iss_lst in issue_dict.iteritems():
+            unq_iss_lst.update(iss_lst)
+        for iss in unq_iss_lst:    
+            md_txt += "- " + iss.title
+            if not hide_links:
+                md_txt += " [(#"+str(iss.number)+")]("+iss.url+")"
+            md_txt += "\n"
+    else:        
+        if len(issue_dict)>0:
+            for label,issue_lst in issue_dict.iteritems():
+                if label == None:
+                   label = "Unclassified"
+                md_txt += "\n**"+label+"**\n\n"
+                for iss in issue_lst:
+                    md_txt += "- " + iss.title
+                    if not hide_links:
+                        md_txt += " [(#"+str(iss.number)+")]("+iss.url+")"
+                    md_txt += "\n"
+    clf = open(file_name, 'w+')
+    clf.write(md_txt.encode('utf8'))
+    clf.close()
+    print "{} created successfully.".format(file_name)
+
+
+def add_iss_label(inobj,issues_dict):
+    labels = inobj["labels"] 
+
+    iss_lbls = [label["name"] for label in labels] #all the tagged label names for the issue
+
+    # include and exclude labels both are non-zero
+    if len(labels_included)>0 and len(labels_excluded)>0:
+        #check if the list of labels contains any of the included labels
+        #and does not contain any of the excluded labels
+        if len(set(iss_lbls) & set(labels_included)) > 0 and len(set(iss_lbls) & set(labels_excluded))==0:
+            #add issue
+            for lbl in iss_lbls:
+                add_to_dict(issues_dict,lbl,inobj)
+    elif len(labels_included) > 0:
+        # check if the list of labels for the issue contains any of the included labels
+        if len(set(iss_lbls) & set(labels_included)) > 0:
+    	    for lbl in iss_lbls:
+    	        add_to_dict(issues_dict,lbl,inobj)
+    elif len(labels_excluded) > 0:
+        # check if the list of labels for the issue does not contains any of the excluded labels
+        if len(set(iss_lbls) & set(labels_excluded)) == 0:
+            if len(iss_lbls) > 0:
+       	        for lbl in iss_lbls:
+    	            add_to_dict(issues_dict,lbl,inobj)
+            else:
+    	        add_to_dict(issues_dict,None,inobj)
+           
+    else:
+        # if both included and excluded labels are empty then add issues directly
+        if len(iss_lbls) > 0:
+            for lbl in iss_lbls:
+                add_to_dict(issues_dict,lbl,inobj)
+        else:
+            add_to_dict(issues_dict,None,inobj)
+
+    
+def add_to_dict(container_dict,key,value):
+    title = value["title"].strip()
+    url = value["html_url"].strip()
+    number = value["number"]
+    issue = Issue()
+    issue.title=title
+    issue.url = url
+    issue.number = number
+
+    if key in container_dict:
+        container_dict[key].append(issue)
+    else:
+        container_dict[key] = [issue]
+
+
+def query_github(query):
+    try:
+        resp = None
+        if private:
+            resp = r.get(query,auth=(username,password))
+        else:
+            resp = r.get(query)
+        return resp
+    except ConnectionError:
+        print "Unable to connect to github. Please check your connection."
+        sys.exit(2)
+    
+#---------------------fetch----------------------------
+def fetch_issues(uname,rname,lts_str,convert):
+    lts = lts_str
+    if convert:
+        try:
+            lts = to_date_string(lts_str)
+        except:
+            print "Error occurred while converting timestamp. Exiting.."
+            parser.print_help()
+            sys.exit(1)
+
+    print "Searching from UTC time: " + lts
+
+    query=FETCH_ISSUES.format(uname,rname,lts)
+    if debug:
+        print "Executing fetch issues query..."
+        print query
+
+    resp = query_github(query)
+
+    if resp.status_code != r.codes.ok:
+        print "oops something went wrong"
+        sys.exit(1)
+    json_resp = resp.json()
+    
+    if debug:
+        pprint(json_resp)
+    if json_resp and len(json_resp) > 0:
+        commit_ts_extraction(lts,json_resp)
+    else:
+        print "No issues found.\nchanGenerated.md NOT generated."
+
+def fetch_issues_tag_based(tag):
+    query = FETCH_TAGS.format(uname,rname,tag)
+    if debug:
+        print "Executing fetch tag query..."
+        print query
+
+    resp = query_github(query)
+    if resp.status_code != r.codes.ok:
+        print "oops something went wrong"
+        sys.exit(1)
+
+    json_resp = resp.json()
+    if debug:
+        pprint(json_resp)
+    if json_resp and len(json_resp) > 0:
+        tag_sha = json_resp["object"]["sha"]
+        sha_type = json_resp["object"]["type"]
+        if debug:
+             print "Tag SHA: "+tag_sha
+
+        if sha_type == "commit":
+            fetch_issues_after_commit(tag_sha)
+        elif sha_type == "tag":
+            commit_sha = fetch_tag_commit(tag_sha)
+            fetch_issues_after_commit(commit_sha)
+        else:
+            print "Unknown type. Exiting..."
+            sys.exit(1)
+    else:
+        print "Tag was not found"
+        sys.exit(1)
+
+
+def fetch_tag_commit(tag_sha):
+    commit_sha = None
+    query = FETCH_TAG.format(uname,rname,tag_sha)
+    if debug:
+        print "Executing fetch tag query..."
+        print query
+
+    resp = query_github(query)
+    if resp.status_code != r.codes.ok:
+        print "oops something went wrong"
+    
+    json_resp = resp.json()
+    if debug:
+        pprint(json_resp)
+    if json_resp and len(json_resp) > 0:
+        commit_sha = json_resp["object"]["sha"]
+        if debug:
+            print "Commit sha: " + commit_sha
+    else:
+        print "Tag was not found"
+        sys.exit(1)
+    return commit_sha
+
+
+def fetch_issues_after_commit(commit_sha):
+    query = FETCH_COMMIT.format(uname,rname,commit_sha)
+    if debug:
+        print "Fetching commit details from server..."
+        print query
+    
+    resp = query_github(query) 
+
+    if resp.status_code != r.codes.ok:
+        #oops something went wrong
+        print "Oops something went wrong: " + str(resp.status_code)
+        sys.exit(1)
+    json_resp = resp.json()
+
+    if json_resp and len(json_resp)>0:
+        date = json_resp["commit"]["committer"]["date"]
+        fetch_issues(uname,rname,date,False)
+    else:
+        print "Commit not found in the repository"
+        sys.exit(2)
+
+    
+def fetch_ranged_issues(start_time,end_time):
+    """
+    fetch issues between the start time and end time in the format YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ
+    """
+    st_tm_flg,st_fmt = check_time_format(start_time)
+    et_tm_flg,et_fmt = check_time_format(end_time)
+
+    if to_timestamp(start_time,st_fmt) > to_timestamp(end_time,et_fmt):
+        print "Start time should be less than end time"
+        sys.exit(1)
+
+    if st_tm_flg != et_tm_flg:
+        print "Start time and end time should be in the same format"
+        sys.exit(1)
+  
+    bracketed_st = start_time
+    bracketed_et = end_time
+    if st_tm_flg:    #if has time
+        #decrease start time by one and increase end time by one day, just to be on the safer side. Think over it later...
+        bracketed_st =  (to_date_obj(start_time,st_fmt) - timedelta(days=1)).strftime(simple_date_format)
+        bracketed_et =  (to_date_obj(end_time,et_fmt) + timedelta(days=1)).strftime(simple_date_format)
+
+
+    query = FETCH_ISSUES_BETWEEN.format(uname,rname,bracketed_st,bracketed_et)
+    if debug:
+        print query
+
+    resp = query_github(query)
+
+    if resp.status_code != r.codes.ok:
+        print "oops something went wrong"
+        sys.exit(1)
+    json_resp = resp.json()
+    if debug:
+        pprint(json_resp)
+    json_resp = json_resp["items"]
+    if json_resp and len(json_resp)>0:
+        time_range_extraction(start_time,end_time,json_resp,st_tm_flg)
+    else:
+        print "No issues found.\nchanGenerated.md NOT generated."
+
+
+def fetch_all_closed_issues():
+    query = FETCH_CLOSED_ISSUES.format(uname,rname)
+    if debug:
+        print "Fetching commit details from server..."
+        print query
+    
+    resp = query_github(query) 
+
+    if resp.status_code != r.codes.ok:
+        #oops something went wrong
+        print "Oops something went wrong"
+        sys.exit(1)
+    json_resp = resp.json()
+
+    if debug:
+        pprint(json_resp)
+    if json_resp and len(json_resp) > 0:
+        extraction(json_resp)
+    else:
+        print "No issues found.\nchanGenerated.md NOT generated."
+
+
+#-------------Date/Time related methods --------------
+def to_date_obj(time_str,time_format):
+    d = time.strptime(time_str, time_format)
+    d = datetime.fromtimestamp(time.mktime(d))
+    return d
+
+def date_obj_to_timestamp(date_obj):
+    return calendar.timegm(date_obj.utctimetuple())
+
+def to_timestamp(date_str,time_format):
+    dt = time.strptime(date_str, time_format)
+    return int(time.mktime(dt))
+
+def to_date_string(timestamp):
+    timeZ = time.strftime(time_format, time.gmtime(int(timestamp.strip())))
+    return timeZ
+
+
+#---------------------Validation-----------------------
+def check_time_format(some_date):
+    has_time = False
+    tm_fmt = ''
+    try:
+        time.strptime(some_date, simple_date_format)
+        tm_fmt = simple_date_format
+    except ValueError:
+        try:
+            time.strptime(some_date, time_format)
+            has_time=True
+            tm_fmt = time_format
+        except ValueError:
+            print "Incorrect date format"
+            sys.exit(1)
+    return has_time,tm_fmt
+
+def validate_labels():
+    if len(set(labels_excluded) & set(labels_included)) > 0:
+        print "Exclude and include labels can not have same values"
+        sys.exit(1)
+
+def check_rate_limit(search_type):
+    """ Checks the rate limit """
+    query= FETCH_RATE_LIMIT
+    if debug:
+        print "Fetching rate limit..."
+        print query
+    resp = query_github(query)
+    if resp.status_code != r.codes.ok:
+        print "oops something went wrong"
+        sys.exit(1)
+    json_resp = resp.json()
+    mins = (json_resp["resources"]["core"]["reset"]-time.time())/60
+
+    remaining_requests = json_resp["resources"]["core"]["remaining"]
+    required_requests = query_dict[search_type]
+
+    if debug:
+        print "Required Requests : {}".format(required_requests)
+        print "Remaining Requests : {}".format(remaining_requests)
+        print "Minutest Remaining : {}".format(mins)
+  
+    if required_requests > remaining_requests :
+        print "The number of required request to complete this operation is {} and you have only {} request(s) remaining. Your requests will reset in {} minutes".format(required_requests, remaining_requests,
+               mins)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("user", help="User name/Organization name based on the repository")
+    parser.add_argument("repo", help="Repository name",metavar='repository')
+    group_c = parser.add_mutually_exclusive_group()
+    group_c.add_argument("--access-token",nargs=1,help="The access token for the user")
+    group_c.add_argument("--ask-pass", action="store_true", help="Ask for password for private repositories")
+    parser.add_argument("-v","--verbose", action="store_true")
+    parser.add_argument("--hide-links",action="store_true",default=False,help="Hide issue links in the generated changelog")
+    parser.add_argument("--show-categorized", action="store_true", help="Show all the changes in seperate section")
+    parser.add_argument("-n","--new-version-name", nargs=1, help="Version name to be kept on the generated changelog")
+    parser.add_argument("--include-labels", nargs='+', help="Labels that have to be included in the changelog")
+    parser.add_argument("--exclude-labels", nargs='+', help="Labels that have to be excluded in the changelog")
+    parser.add_argument("-o","--out-file",nargs='?',default='chanGenerator.md', help="Out file name")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("-z","--timestamp",nargs=1, help="Timestamp after which you want to generate the changelog.")
+    group.add_argument("-d","--utc-time",nargs=1, help="UTC time after which you want to generate the changelog.")
+    group.add_argument("-c","--commit",nargs=1, help="Commit after which you want to generate the changelog.")
+    group.add_argument("-t","--tag",nargs=1,help="Tag after which you want to generate the changelog.")
+    group.add_argument("-r","--time-range",nargs=2, help="Pass two parameters a start and an end time of the format YYYY-MM-DDTHH:MM:SSZ(UTC Time format) or YYYY-MM-DD")
+    group.add_argument("-a","--all",action="store_true", help="Fetch all closed issues")
+    
+    args = parser.parse_args()
+    
+    uname = args.user
+    rname = args.repo
+    
+    #output file
+    file_name = args.out_file
+    
+    #set debug flag true if verbose
+    if args.verbose:
+        debug=True
+    if args.show_categorized:
+        categorize=True
+    if args.ask_pass:
+        private=True
+        username=raw_input('Enter username:')
+        password=getpass.getpass('Enter password:')
+    elif args.access_token:
+        private=True
+        username=args.access_token[0]
+        password=""
+    
+    if args.new_version_name:
+        header = args.new_version_name[0]
+    
+    if args.include_labels:
+        labels_included = args.include_labels
+        
+    if args.exclude_labels:
+        labels_excluded = args.exclude_labels
+    
+    validate_labels()
+    
+    if args.hide_links:
+        hide_links=True
+    
+    if args.time_range:
+        check_rate_limit('other')
+        fetch_ranged_issues(args.time_range[0], args.time_range[1])
+    elif args.commit:
+        check_rate_limit('commit')
+        fetch_issues_after_commit(args.commit[0])
+    elif args.timestamp:
+        check_rate_limit('timestamp')
+        fetch_issues(uname,rname,args.timestamp[0],True)
+    elif args.utc_time:
+        check_rate_limit('other')
+        fetch_issues(uname,rname,args.utc_time[0],False)
+    elif args.tag:
+        check_rate_limit('tag')
+        fetch_issues_tag_based(args.tag[0])
+    elif args.all:
+        check_rate_limit('other')
+        fetch_all_closed_issues()
+
